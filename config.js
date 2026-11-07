@@ -2,6 +2,6 @@
 // The publishable/anon key is meant to be public; the data is protected by
 // login plus the row-level security in schema.sql.
 window.LITTLE_DOSES_CONFIG = {
-  supabaseUrl: "https://YOUR-PROJECT.supabase.co",
-  supabaseKey: "YOUR-PUBLISHABLE-OR-ANON-KEY",
+  supabaseUrl: "https://exjdkdjpbmkpyleciken.supabase.co",
+  supabaseKey: "sb_publishable_91Fg2EXmFTyq0N0V-wE_Vw_iFTPGgHW",
 };
