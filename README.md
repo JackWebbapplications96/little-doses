@@ -8,6 +8,7 @@ A small shared medicine tracker for a baby at home. Both parents sign in on thei
 ## What it does
 
 - **Today:** each day's doses grouped by time. Tap a dose to mark it given, and it records who gave it and when. Tap a given dose to add a note or undo it. A dose logged on one phone shows up on the other straight away. Doses within an hour of their time are marked *Due now*, and doses later than that are marked *Overdue*. You can step back through earlier days.
+- **Feeds:** a feeding plan with a daily target (ml per 24 hours, with an ml/kg/day × weight calculator) and feed times (or "every 3 hours from 06:00"). Log each scheduled feed or an extra one as expressed milk, formula or a breastfeed. It shows the running total against the target, how much is left to go and roughly how much per remaining feed, and when she was last fed. A summary also appears on *Today*.
 - **Supplies:** remaining amount, days left and run-out date for each medicine, counted down automatically from the doses given. Orange means *order soon* (at the reminder threshold you set), and red means two days left or less. *I've ordered more* stops the nagging. *Delivery arrived* adds stock, and *Correct count* fixes any drift such as spills or bottle overfill.
 - **Medicines:** add or edit dose, unit, daily times (none means *as needed*), instructions and how to reorder. You can stop a medicine without losing its history.
 
@@ -16,7 +17,7 @@ A small shared medicine tracker for a baby at home. Both parents sign in on thei
 ### 1. Supabase
 
 1. Create a free account at [supabase.com](https://supabase.com) and add a **New project**. Choose a London region (`eu-west-2`) and any database password.
-2. Open **SQL Editor → New query**, paste the contents of [`schema.sql`](schema.sql) and click **Run**.
+2. Open **SQL Editor → New query**, paste the contents of [`schema.sql`](schema.sql) and click **Run**. Do the same with [`feeds.sql`](feeds.sql).
 3. In **Authentication → Sign In / Providers** (labelled *Settings* on some versions), turn **off** *Allow new users to sign up*. That way the only accounts are the two you create.
 4. In **Authentication → Users → Add user → Create new user**, create one for each parent with an email and password, and tick **Auto Confirm User**.
 5. In **Project Settings → API Keys** (or **API**), copy the **Project URL** and the **publishable** key (older projects call it the `anon` `public` key). Paste both into [`config.js`](config.js).

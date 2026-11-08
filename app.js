@@ -17,6 +17,7 @@
   });
 
   const UNITS = ["ml", "mg", "mcg", "drops", "tablets", "sachets"];
+  const FEED_TYPES = { expressed: "Expressed milk", formula: "Formula", breastfeed: "Breastfeed" };
   const state = {
     session: null,
     tab: "today",
@@ -24,6 +25,9 @@
     meds: [],
     stock: {},
     doses: [],
+    feeds: [],
+    plans: [],
+    feedsReady: true,
     loaded: false,
     live: false,
     busy: new Set(),
@@ -88,16 +92,24 @@
 
   // ---------- data ----------
   async function load() {
-    const [m, s, d] = await Promise.all([
+    const [m, s, d, f, p] = await Promise.all([
       sb.from("medications").select("*").order("created_at"),
       sb.from("medication_stock").select("*"),
       sb.from("doses").select("*").eq("day", state.day).order("given_at"),
+      sb.from("feeds").select("*").eq("day", state.day).order("fed_at"),
+      sb.from("feed_plans").select("*").order("starts_on"),
     ]);
     const err = m.error || s.error || d.error;
     if (err) { fail(err); return; }
     state.meds = m.data;
     state.stock = Object.fromEntries(s.data.map(r => [r.medication_id, r.remaining]));
     state.doses = d.data;
+    const feedErr = f.error || p.error;
+    // Feed tables come from feeds.sql; until it's been run, the rest of the app still works.
+    state.feedsReady = !feedErr;
+    if (feedErr && !["PGRST205", "42P01"].includes(feedErr.code)) fail(feedErr);
+    state.feeds = f.data || [];
+    state.plans = p.data || [];
     state.loaded = true;
     render();
   }
@@ -117,7 +129,7 @@
     if (!state.session) return renderLogin();
     if (!state.loaded) { app.innerHTML = `<p class="boot">Loading…</p>`; return; }
     const orderCount = state.meds.filter(needsOrder).length;
-    const views = { today: viewToday, supplies: viewSupplies, meds: viewMeds };
+    const views = { today: viewToday, feeds: viewFeeds, supplies: viewSupplies, meds: viewMeds };
     app.innerHTML = `
       <header class="top">
         <div class="brand"><img src="icon.svg" width="30" height="30" alt="">Little Doses</div>
@@ -126,6 +138,7 @@
       <main>${views[state.tab]()}</main>
       <nav class="tabs" aria-label="Sections">
         ${tabBtn("today", "Today")}
+        ${tabBtn("feeds", "Feeds")}
         ${tabBtn("supplies", "Supplies", orderCount)}
         ${tabBtn("meds", "Medicines")}
       </nav>`;
@@ -218,15 +231,127 @@
     }
 
     return `
+      ${dayBar(total ? `${given} of ${total} given` : "", total ? given / total : null)}
+      ${alerts}
+      ${feedStrip(day)}
+      ${body}`;
+  }
+
+  function dayBar(summary, fraction) {
+    const day = state.day;
+    return `
       <div class="daybar">
         <button type="button" class="icon-btn" data-action="prev-day" aria-label="Previous day">‹</button>
-        <div class="day"><strong>${dayName(day)}</strong><span>${parseDay(day).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}${total ? ` · ${given} of ${total} given` : ""}</span></div>
+        <div class="day"><strong>${dayName(day)}</strong><span>${parseDay(day).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}${summary ? ` · ${summary}` : ""}</span></div>
         <button type="button" class="icon-btn" data-action="next-day" aria-label="Next day">›</button>
       </div>
-      ${total ? `<div class="progress"><i style="width:${(given / total) * 100}%"></i></div>` : ""}
-      ${day !== today() ? `<div class="back-today"><button type="button" class="link" data-action="go-today">Back to today</button></div>` : ""}
-      ${alerts}
-      ${body}`;
+      ${fraction !== null ? `<div class="progress"><i style="width:${Math.min(1, fraction) * 100}%"></i></div>` : ""}
+      ${day !== today() ? `<div class="back-today"><button type="button" class="link" data-action="go-today">Back to today</button></div>` : ""}`;
+  }
+
+  // ---------- feeds ----------
+  function planFor(day) {
+    return state.plans.filter(p => p.starts_on <= day).pop() || null;
+  }
+
+  function feedDay(day) {
+    const plan = planFor(day);
+    const feeds = state.feeds;
+    const total = feeds.reduce((n, f) => n + Number(f.amount_ml || 0), 0);
+    const times = plan?.times || [];
+    const planned = plan ? Number(plan.amount_per_feed || (times.length ? plan.target_ml / times.length : 0)) : 0;
+    const slots = times.map(time => {
+      const feed = feeds.find(f => f.slot === time);
+      return { time, feed, status: doseStatus(day, time, feed) };
+    });
+    const extras = feeds.filter(f => !f.slot || !times.includes(f.slot));
+    const left = slots.filter(s => !s.feed && ["upcoming", "due"].includes(s.status));
+    const toGo = plan ? Math.max(0, plan.target_ml - total) : 0;
+    const last = feeds.length ? feeds[feeds.length - 1] : null;
+    return { plan, total, planned, slots, extras, left, toGo, last };
+  }
+
+  function ago(ts) {
+    const mins = Math.max(0, Math.round((Date.now() - new Date(ts)) / 60000));
+    if (mins < 60) return `${mins} min ago`;
+    return `${Math.floor(mins / 60)} h ${mins % 60} min ago`;
+  }
+
+  function feedProgressText(fd, day) {
+    if (!fd.plan) return "No daily target set yet.";
+    if (fd.total >= fd.plan.target_ml) return "Daily target reached.";
+    if (day === today() && fd.left.length) {
+      const n = fd.left.length;
+      return `${fmt(fd.toGo)} ml to go · ${n} feed${n === 1 ? "" : "s"} left, about ${Math.ceil(fd.toGo / n)} ml each.`;
+    }
+    if (day > today()) return `${fmt(fd.plan.target_ml)} ml planned.`;
+    return `${fmt(fd.toGo)} ml short of the daily target.`;
+  }
+
+  function feedStrip(day) {
+    if (!state.feedsReady) return "";
+    const fd = feedDay(day);
+    if (!fd.plan && !state.feeds.length) return "";
+    const next = day === today() && fd.left[0];
+    return `<button type="button" class="feed-strip" data-tab="feeds">
+      <div><strong>Feeds</strong><span>${fmt(fd.total)}${fd.plan ? ` of ${fmt(fd.plan.target_ml)}` : ""} ml${next ? ` · next ${next.time}` : ""}</span></div>
+      ${fd.plan ? `<div class="progress"><i style="width:${Math.min(100, (fd.total / fd.plan.target_ml) * 100)}%"></i></div>` : ""}
+    </button>`;
+  }
+
+  function viewFeeds() {
+    if (!state.feedsReady) {
+      return `<div class="empty"><h2>One more step</h2>
+        <p>Run <b>feeds.sql</b> in the Supabase SQL Editor to switch on feed tracking, then reload this page.</p></div>`;
+    }
+    const day = state.day;
+    const fd = feedDay(day);
+    const isFuture = day > today();
+    const n = fd.slots.length;
+    const done = fd.slots.filter(s => s.feed).length;
+
+    const entries = [
+      ...fd.slots.map(s => ({ time: s.time, html: feedRow(s.time, s.feed, s.status, fd.planned, isFuture) })),
+      ...fd.extras.map(f => ({ time: clock(f.fed_at), html: feedRow(null, f, "given", 0, false) })),
+    ].sort((a, b) => a.time.localeCompare(b.time));
+
+    return `
+      ${dayBar(n ? `${done} of ${n} feeds` : "", null)}
+      <section class="feed-card">
+        <div class="feed-total"><span class="big">${fmt(fd.total)}</span><span>${fd.plan ? `of ${fmt(fd.plan.target_ml)} ml in 24 hours` : "ml today"}</span></div>
+        ${fd.plan ? `<div class="progress"><i style="width:${Math.min(100, (fd.total / fd.plan.target_ml) * 100)}%"></i></div>` : ""}
+        <p class="meta">${feedProgressText(fd, day)}</p>
+        ${day === today() && fd.last ? `<p class="meta">Last fed at ${clock(fd.last.fed_at)}, ${ago(fd.last.fed_at)}.</p>` : ""}
+      </section>
+      <div class="feed-actions">
+        <button type="button" class="btn primary" data-action="extra-feed" ${isFuture ? "disabled" : ""}>Log a feed</button>
+        <button type="button" class="btn" data-action="edit-plan">${fd.plan ? "Feeding plan" : "Set up feeding plan"}</button>
+      </div>
+      ${entries.length ? `<div class="schedule">${entries.map(e => `
+        <section class="slot"><div class="time">${esc(e.time)}</div><div class="rows">${e.html}</div></section>`).join("")}</div>`
+        : `<div class="empty"><p>${fd.plan ? "No feeds logged on this day." : "Set up her feeding plan to get a schedule and a daily target, or just log feeds as they happen."}</p></div>`}`;
+  }
+
+  function feedRow(slot, feed, status, planned, disabled) {
+    const labels = { due: "Due now", late: "Overdue", missed: "Not logged", upcoming: "" };
+    let title, detail;
+    if (feed) {
+      title = feed.amount_ml != null ? `${fmt(feed.amount_ml)} ml` : FEED_TYPES[feed.type];
+      detail = [feed.amount_ml != null ? FEED_TYPES[feed.type] : "", feed.duration_min ? `${feed.duration_min} min` : "", slot ? "" : "extra feed"]
+        .filter(Boolean).join(" · ");
+    } else {
+      title = "Feed";
+      detail = planned ? `${fmt(Math.round(planned))} ml planned` : "";
+    }
+    const stateText = feed ? `${clock(feed.fed_at)}${feed.given_by ? `<br>${esc(feed.given_by)}` : ""}` : labels[status];
+    return `<button type="button" class="dose ${feed ? "given" : status}" data-action="${feed ? "edit-feed" : "log-feed"}"
+        ${slot ? `data-slot="${esc(slot)}"` : ""} ${feed ? `data-feed="${feed.id}"` : ""}
+        ${disabled && !feed ? "disabled" : ""}>
+      <span class="tick"></span>
+      <span class="what"><strong>${esc(title)}</strong><span>${esc(detail)}</span>
+        ${feed?.note ? `<span class="note">${esc(feed.note)}</span>` : ""}</span>
+      <span class="state">${stateText}</span>
+    </button>`;
   }
 
   function doseRow(med, slot, dose, status, disabled) {
@@ -507,6 +632,162 @@
     form => form.querySelector("#stock-amount").focus());
   }
 
+  function feedForm(slot, feed) {
+    const day = state.day;
+    const fd = feedDay(day);
+    const type = feed?.type || state.feeds[state.feeds.length - 1]?.type || fd.plan?.default_type || "expressed";
+    const amount = feed ? (feed.amount_ml ?? "") : (fd.planned ? Math.round(fd.planned) : "");
+    const time = feed ? clock(feed.fed_at) : day === today() ? clock(new Date()) : (slot || "12:00");
+    openSheet(`
+      <h2 id="sheet-title">${feed ? "Edit feed" : slot ? `${esc(slot)} feed` : "Log a feed"}</h2>
+      ${feed ? `<p class="sub">Logged by ${esc(feed.given_by || "someone")}</p>` : ""}
+      <fieldset><legend>Milk</legend><div class="seg">
+        ${Object.entries(FEED_TYPES).map(([v, l]) => `<label><input type="radio" name="type" value="${v}" ${v === type ? "checked" : ""}><span>${l}</span></label>`).join("")}
+      </div></fieldset>
+      <div class="row2">
+        <label class="field"><span id="amount-label">Amount (ml)</span><input id="feed-amount" name="amount" type="number" inputmode="decimal" step="any" min="0" value="${esc(amount)}"></label>
+        <label class="field">Time<input id="feed-time" name="time" type="time" value="${esc(time)}" required></label>
+      </div>
+      <label class="field" id="duration-field">Minutes feeding <small>optional</small>
+        <input id="feed-duration" name="duration" type="number" inputmode="numeric" min="0" step="1" value="${esc(feed?.duration_min ?? "")}"></label>
+      <label class="field">Note <small>optional, e.g. via tube, fortifier added, brought some back up</small>
+        <textarea id="feed-note" name="note">${esc(feed?.note)}</textarea></label>
+      <div class="sheet-actions">
+        ${feed ? `<button type="submit" class="btn danger" name="op" value="delete" id="feed-delete">Delete</button>` : ""}
+        <span class="spacer"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn primary" name="op" value="save">${feed ? "Save" : "Log feed"}</button>
+      </div>`,
+    async (form, submitter) => {
+      if (submitter?.value === "delete") {
+        const btn = document.getElementById("feed-delete");
+        if (!btn.dataset.armed) { btn.dataset.armed = "1"; btn.textContent = "Tap again to delete"; return false; }
+        const { error } = await sb.from("feeds").delete().eq("id", feed.id);
+        if (error) throw error;
+        toast("Feed deleted"); return load();
+      }
+      const kind = form.get("type");
+      const raw = form.get("amount");
+      const ml = raw === "" ? null : Number(raw);
+      if (kind !== "breastfeed" && !(ml > 0)) return formError("Enter how many ml she had.");
+      if (ml !== null && !(ml >= 0)) return formError("Enter the amount as a number.");
+      const t = form.get("time");
+      if (!t) return formError("Enter the time of the feed.");
+      const dur = form.get("duration");
+      const row = {
+        type: kind,
+        amount_ml: ml,
+        duration_min: kind === "breastfeed" && dur !== "" ? Math.max(0, parseInt(dur, 10) || 0) : null,
+        fed_at: new Date(`${day}T${t}:00`).toISOString(),
+        note: form.get("note").trim() || null,
+      };
+      if (feed) {
+        const { error } = await sb.from("feeds").update(row).eq("id", feed.id);
+        if (error) throw error;
+        toast("Feed saved");
+      } else {
+        const { error } = await sb.from("feeds").insert({ ...row, day, slot: slot || null, given_by: myName() });
+        if (error?.code === "23505") toast("That feed was just logged on the other phone");
+        else if (error) throw error;
+        else toast(ml != null ? `${fmt(ml)} ml logged` : "Feed logged");
+      }
+      return load();
+    },
+    form => {
+      const sync = () => {
+        const bf = form.querySelector('input[name="type"]:checked')?.value === "breastfeed";
+        document.getElementById("duration-field").hidden = !bf;
+        document.getElementById("amount-label").textContent = bf ? "Amount (ml, if known)" : "Amount (ml)";
+      };
+      form.querySelectorAll('input[name="type"]').forEach(r => r.addEventListener("change", sync));
+      sync();
+    });
+  }
+
+  function planForm() {
+    const current = planFor(today());
+    const p = current || {
+      target_ml: "", amount_per_feed: "", default_type: "expressed",
+      times: ["00:00", "03:00", "06:00", "09:00", "12:00", "15:00", "18:00", "21:00"],
+    };
+    const timeRow = t => `<div class="time-row"><input type="time" name="time" value="${esc(t)}" required aria-label="Feed time">
+      <button type="button" class="btn" data-remove-time aria-label="Remove time">×</button></div>`;
+    openSheet(`
+      <h2 id="sheet-title">Feeding plan</h2>
+      <p class="sub">Changes apply from today. Earlier days keep the plan they had.</p>
+      <label class="field">Daily target <small>ml per 24 hours</small>
+        <input id="plan-target" name="target_ml" type="number" inputmode="decimal" step="any" min="1" value="${esc(p.target_ml)}" required></label>
+      <div class="calc">
+        <span>Work it out:</span>
+        <input id="calc-mlkg" type="number" inputmode="decimal" step="any" min="0" placeholder="150" aria-label="ml per kg per day"><span>ml/kg/day ×</span>
+        <input id="calc-kg" type="number" inputmode="decimal" step="any" min="0" placeholder="2.4" aria-label="Weight in kg"><span>kg</span>
+        <button type="button" class="btn sm" id="calc-go">Use</button>
+      </div>
+      <fieldset><legend>Feed times</legend>
+        <div class="calc">
+          <span>Every</span><input id="gen-hours" type="number" inputmode="decimal" step="any" min="1" max="12" value="3" aria-label="Hours between feeds">
+          <span>hours from</span><input id="gen-start" type="time" value="${esc(p.times[0] || "06:00")}" aria-label="First feed time">
+          <button type="button" class="btn sm" id="gen-go">Fill in</button>
+        </div>
+        <div id="times">${p.times.map(timeRow).join("")}</div>
+        <button type="button" class="link" data-add-time style="justify-self:start">+ Add a time</button>
+      </fieldset>
+      <label class="field">Amount per feed <small>optional; leave blank to split the target evenly</small>
+        <input id="plan-per-feed" name="amount_per_feed" type="number" inputmode="decimal" step="any" min="0" value="${esc(p.amount_per_feed ?? "")}"></label>
+      <label class="field">Usual milk
+        <select id="plan-type" name="default_type">${Object.entries(FEED_TYPES).map(([v, l]) => `<option value="${v}" ${v === p.default_type ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+      <div class="sheet-actions"><span class="spacer"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn primary">Save plan</button></div>`,
+    async form => {
+      const target = Number(form.get("target_ml"));
+      if (!(target > 0)) return formError("Enter the daily target in ml.");
+      const per = form.get("amount_per_feed");
+      const row = {
+        starts_on: today(),
+        target_ml: target,
+        times: [...new Set(form.getAll("time").filter(Boolean))].sort(),
+        amount_per_feed: per === "" ? null : Number(per) || null,
+        default_type: form.get("default_type"),
+        updated_at: new Date().toISOString(),
+      };
+      const { error } = await sb.from("feed_plans").upsert(row, { onConflict: "starts_on" });
+      if (error) throw error;
+      toast("Feeding plan saved");
+      return load();
+    },
+    form => {
+      const box = form.querySelector("#times");
+      const perFeed = form.querySelector("#plan-per-feed");
+      const target = form.querySelector("#plan-target");
+      const hint = () => {
+        const n = box.querySelectorAll("input").length;
+        perFeed.placeholder = n && target.value ? `${Math.round(target.value / n)} ml (${n} feeds)` : "";
+      };
+      form.querySelector("[data-add-time]").onclick = () => { box.insertAdjacentHTML("beforeend", timeRow("12:00")); hint(); };
+      box.addEventListener("click", e => { if (e.target.closest("[data-remove-time]")) { e.target.closest(".time-row").remove(); hint(); } });
+      target.addEventListener("input", hint);
+      form.querySelector("#calc-go").onclick = () => {
+        const v = Number(form.querySelector("#calc-mlkg").value) * Number(form.querySelector("#calc-kg").value);
+        if (v > 0) { target.value = Math.round(v); hint(); }
+      };
+      form.querySelector("#gen-go").onclick = () => {
+        const h = Number(form.querySelector("#gen-hours").value);
+        const start = form.querySelector("#gen-start").value;
+        if (!(h >= 1) || !start) return;
+        const [sh, sm] = start.split(":").map(Number);
+        const times = [];
+        for (let i = 0; i < Math.floor(24 / h); i++) {
+          const m = (sh * 60 + sm + Math.round(i * h * 60)) % 1440;
+          times.push(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
+        }
+        box.innerHTML = times.sort().map(timeRow).join("");
+        hint();
+      };
+      hint();
+    });
+  }
+
   function renameForm() {
     openSheet(`
       <h2 id="sheet-title">Your name</h2>
@@ -539,8 +820,12 @@
     if (!el || el.disabled) return;
     const med = el.dataset.med && medById(el.dataset.med);
     switch (el.dataset.action) {
-      case "prev-day": state.day = addDays(state.day, -1); state.doses = []; render(); load(); break;
-      case "next-day": state.day = addDays(state.day, 1); state.doses = []; render(); load(); break;
+      case "prev-day": state.day = addDays(state.day, -1); state.doses = []; state.feeds = []; render(); load(); break;
+      case "next-day": state.day = addDays(state.day, 1); state.doses = []; state.feeds = []; render(); load(); break;
+      case "log-feed": feedForm(el.dataset.slot, null); break;
+      case "extra-feed": feedForm(null, null); break;
+      case "edit-feed": feedForm(null, state.feeds.find(f => f.id === el.dataset.feed)); break;
+      case "edit-plan": planForm(); break;
       case "go-today": state.day = today(); load(); break;
       case "give": give(med, el.dataset.slot); break;
       case "give-prn": give(med, `prn-${Date.now()}`); break;
